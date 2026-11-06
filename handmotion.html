@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pick Up Objects With Your Hand</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>Pick up objects with your hand</h1>
+    <p class="sub">Start the camera, then pinch your thumb and index finger together over an object to grab it. Move your hand to carry it, and open your fingers to let go.</p>
+
+    <div id="stage" class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div id="start-panel" class="panel">
+        <button id="start-btn" type="button">Start camera</button>
+        <p class="note">Your browser will ask for camera permission. Video is never uploaded or saved; everything runs on your device.</p>
+      </div>
+    </div>
+
+    <p id="status" class="status" aria-live="polite"></p>
+    <button id="reset-btn" type="button" class="secondary" hidden>Reset objects</button>
+  </main>
+
+  <script type="module">
+    import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+    const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+    const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+    const EMOJIS = ["🍎", "⚽", "📦", "🎲", "⭐", "🍕"];
+    const CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+    ];
+
+    const stage = document.getElementById("stage");
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    const panel = document.getElementById("start-panel");
+    const startBtn = document.getElementById("start-btn");
+    const resetBtn = document.getElementById("reset-btn");
+    const statusEl = document.getElementById("status");
+
+    let handLandmarker = null;
+    let objects = [];
+    let hands = [];            // pixel-space landmarks for each detected hand
+    let pinchInfo = [];        // { point, pinching } for each hand
+    const grabs = new Map();   // hand index -> { obj, dx, dy }
+    let lastVideoTime = -1;
+
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const setStatus = (msg) => { statusEl.textContent = msg; };
+
+    function layoutObjects() {
+      const W = canvas.width, H = canvas.height;
+      const size = Math.round(W * 0.09);
+      objects = EMOJIS.map((emoji, i) => ({
+        emoji,
+        size,
+        x: (W * (i + 1)) / (EMOJIS.length + 1),
+        y: H * (0.72 + (i % 2) * 0.1)
+      }));
+      grabs.clear();
+    }
+
+    async function startCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw Object.assign(new Error("no-media"), { name: "NoMediaDevices" });
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      stage.style.aspectRatio = video.videoWidth + " / " + video.videoHeight;
+    }
+
+    async function loadModel() {
+      const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+      const make = (delegate) => HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      try {
+        handLandmarker = await make("GPU");
+      } catch (e) {
+        handLandmarker = await make("CPU");
+      }
+    }
+
+    function update(landmarks) {
+      const W = canvas.width, H = canvas.height;
+      // The video is shown mirrored, so flip x to match what the person sees.
+      hands = landmarks.map((lm) => lm.map((p) => ({ x: (1 - p.x) * W, y: p.y * H })));
+      pinchInfo = [];
+
+      for (const idx of [...grabs.keys()]) {
+        if (!hands[idx]) grabs.delete(idx);
+      }
+
+      hands.forEach((pts, i) => {
+        const handSize = dist(pts[0], pts[9]);
+        const gap = dist(pts[4], pts[8]);
+        const point = { x: (pts[4].x + pts[8].x) / 2, y: (pts[4].y + pts[8].y) / 2 };
+        const held = grabs.get(i);
+        // Hysteresis: easier to keep holding than to start holding.
+        const pinching = held ? gap < handSize * 0.5 : gap < handSize * 0.32;
+        pinchInfo[i] = { point, pinching };
+
+        if (pinching && !held) {
+          const taken = new Set([...grabs.values()].map((g) => g.obj));
+          for (let k = objects.length - 1; k >= 0; k--) {
+            const o = objects[k];
+            if (taken.has(o)) continue;
+            if (dist(o, point) < o.size * 0.7) {
+              grabs.set(i, { obj: o, dx: o.x - point.x, dy: o.y - point.y });
+              objects.splice(k, 1);
+              objects.push(o); // bring to front
+              break;
+            }
+          }
+        } else if (pinching && held) {
+          const o = held.obj;
+          const tx = point.x + held.dx;
+          const ty = point.y + held.dy;
+          o.x += (tx - o.x) * 0.5;
+          o.y += (ty - o.y) * 0.5;
+          o.x = Math.min(W - o.size / 2, Math.max(o.size / 2, o.x));
+          o.y = Math.min(H - o.size / 2, Math.max(o.size / 2, o.y));
+        } else if (!pinching && held) {
+          grabs.delete(i);
+        }
+      });
+
+      if (hands.length === 0) {
+        setStatus("Show your hand to the camera.");
+      } else if (grabs.size > 0) {
+        setStatus("Got it! Move your hand, and open your fingers to let go.");
+      } else {
+        setStatus("Pinch your thumb and index finger together over an object.");
+      }
+    }
+
+    function draw() {
+      const W = canvas.width;
+      const scale = W / 960;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const heldSet = new Set([...grabs.values()].map((g) => g.obj));
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      for (const o of objects) {
+        const isHeld = heldSet.has(o);
+        const s = isHeld ? o.size * 1.15 : o.size;
+        if (isHeld) {
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.size * 0.75, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(255, 183, 3, 0.25)";
+          ctx.fill();
+          ctx.lineWidth = 3 * scale;
+          ctx.strokeStyle = "#ffb703";
+          ctx.stroke();
+        }
+        ctx.font = s + 'px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif';
+        ctx.fillStyle = "#fff";
+        ctx.fillText(o.emoji, o.x, o.y);
+      }
+
+      hands.forEach((pts, i) => {
+        ctx.lineWidth = 2 * scale;
+        ctx.strokeStyle = "rgba(255,255,255,0.7)";
+        ctx.beginPath();
+        for (const [a, b] of CONNECTIONS) {
+          ctx.moveTo(pts[a].x, pts[a].y);
+          ctx.lineTo(pts[b].x, pts[b].y);
+        }
+        ctx.stroke();
+
+        ctx.fillStyle = "#fff";
+        for (const p of pts) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 3 * scale, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        const info = pinchInfo[i];
+        if (info) {
+          ctx.beginPath();
+          ctx.arc(info.point.x, info.point.y, (info.pinching ? 12 : 9) * scale, 0, Math.PI * 2);
+          ctx.fillStyle = info.pinching ? "#2ec4b6" : "rgba(255,255,255,0.25)";
+          ctx.fill();
+          ctx.lineWidth = 2 * scale;
+          ctx.strokeStyle = info.pinching ? "#fff" : "rgba(255,255,255,0.8)";
+          ctx.stroke();
+        }
+      });
+    }
+
+    function loop() {
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const result = handLandmarker.detectForVideo(video, performance.now());
+        update(result.landmarks || []);
+      }
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      try {
+        setStatus("Allow camera access when your browser asks…");
+        await startCamera();
+        setStatus("Loading the hand tracking model…");
+        await loadModel();
+        layoutObjects();
+        panel.hidden = true;
+        resetBtn.hidden = false;
+        setStatus("Show your hand to the camera.");
+        loop();
+      } catch (err) {
+        startBtn.disabled = false;
+        if (err.name === "NotAllowedError") {
+          setStatus("Camera permission was blocked. Click the camera icon in the address bar, choose Allow, and try again.");
+        } else if (err.name === "NotFoundError") {
+          setStatus("No camera found. Connect a camera and try again.");
+        } else if (err.name === "NoMediaDevices" || !window.isSecureContext) {
+          setStatus("The camera only works on https or localhost. Open this page through GitHub Pages.");
+        } else {
+          setStatus("Something went wrong: " + err.message + ". Check your internet connection and try again.");
+        }
+      }
+    });
+
+    resetBtn.addEventListener("click", layoutObjects);
+  </script>
+</body>
+</html>
